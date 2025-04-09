@@ -1,0 +1,11 @@
+# Ignore virtual environments
+venv/
+__pycache__/
+*.pyc
+
+# VSCode junk
+.vscode/
+
+# OS junk
+.DS_Store
+Thumbs.db
