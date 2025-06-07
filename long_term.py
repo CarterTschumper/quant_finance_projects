@@ -1,48 +1,29 @@
 # long_term.py
 """
-Fetches 10 years of hourly adjusted OHLVC + Volume for a list of US stocks.
+Fetches 10 years of hourly UNADJUSTED (TRADES) OHLVC + Volume for US stocks.
 Saves hourly data per symbol and an aggregated daily volume CSV.
-
-WARNING: This script can take a VERY LONG TIME to run for many symbols
-         due to API request limits and pacing requirements.
-         Run it in a stable environment where it can be left unattended.
-         Start with a small list of symbols to test.
+Addresses date parsing issues and TWS timezone warnings.
 """
 
 import pandas as pd
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone # Ensure timezone is imported
 from typing import List, Dict, Optional
 import os
-import threading # <--- MISSING IMPORT ADDED HERE
+import threading
 
-# Import the IBDataApp class from our IBKR interaction module
-# We will use its methods directly for more control over a long session.
-from ib_functions import IBDataApp # Assuming IBDataApp is in ib_functions.py
-from ibapi.contract import Contract # For creating contract objects
+from ib_functions import IBDataApp
+from ibapi.contract import Contract
 
 # --- Configuration ---
-# LIST OF US STOCK SYMBOLS TO FETCH DATA FOR
-# !!! START WITH A VERY SMALL LIST (2-3 symbols) FOR INITIAL TESTING !!!
-# Once confirmed working, you can expand this list.
-# Fetching for "thousands" will take days/weeks.
 SYMBOLS_TO_FETCH: List[str] = [
-    "AAPL", "MSFT", "GOOGL",
-    # "AMZN", "NVDA", "TSLA", "BRK-B", "JPM", "JNJ", "V",
-    # "PG", "UNH", "HD", "MA", "PYPL", "DIS", "NFLX", "ADBE", "CRM", "XOM",
-    # "SPY", "QQQ" # Also works for ETFs if sec_type is adjusted
+    "AAPL", "MSFT", # "GOOGL", # Start with 1-2 symbols
 ]
 
-# Parameters for historical data request
 YEARS_OF_DATA: int = 10
 HOURLY_BAR_SIZE: str = "1 hour"
-# For adjusted data (Open, High, Low, Close, Volume, WAP are adjusted)
-HOURLY_WHAT_TO_SHOW: str = "ADJUSTED_LAST"
-
-# How much data to request in each chunk (e.g., "1 M", "2 M")
-# Smaller chunks are safer for API limits but mean more requests.
-# IBKR limit for 1-hour bars is often around 1-2 months. Let's use 1 month.
-CHUNK_DURATION: str = "1 M"
+HOURLY_WHAT_TO_SHOW: str = "TRADES" # Must be TRADES for historical endDateTime chunking
+CHUNK_DURATION: str = "2 M"
 
 PRIMARY_EXCHANGE_MAP: Dict[str, str] = {
     "AAPL": "NASDAQ", "MSFT": "NASDAQ", "GOOGL": "NASDAQ", "AMZN": "NASDAQ",
@@ -55,24 +36,50 @@ PRIMARY_EXCHANGE_MAP: Dict[str, str] = {
 DEFAULT_EXCHANGE: str = "SMART"
 DEFAULT_CURRENCY: str = "USD"
 
-# TWS Connection Parameters
-TWS_PORT: int = 7497  # Default for TWS Paper trading
-APP_CLIENT_ID: int = 1001 # A single client ID for the entire session
+TWS_PORT: int = 7497
+APP_CLIENT_ID: int = 1001
 
-# Output directories and file names
-OUTPUT_DIR_HOURLY: str = "hourly_data_10Y"
-OUTPUT_DAILY_VOLUME_CSV: str = "all_daily_volumes_10Y.csv"
+OUTPUT_DIR_HOURLY: str = "hourly_data_10Y_TRADES"
+OUTPUT_DAILY_VOLUME_CSV: str = "all_daily_volumes_10Y_TRADES.csv"
 
-# Pacing between API requests for different symbols (in seconds)
-SYMBOL_REQUEST_DELAY: int = 10 # Increase if facing pacing issues for many symbols
-# Pacing between chunked requests for the SAME symbol
-CHUNK_REQUEST_DELAY: int = 3 # Can be shorter, but still important
+SYMBOL_REQUEST_DELAY: int = 10
+CHUNK_REQUEST_DELAY: int = 4
+CHUNK_TIMEOUT_SECONDS: int = 90 # Increased from previous version
 
 def create_output_dirs():
-    """Creates output directories if they don't exist."""
     if not os.path.exists(OUTPUT_DIR_HOURLY):
         os.makedirs(OUTPUT_DIR_HOURLY)
         print(f"Created directory: {OUTPUT_DIR_HOURLY}")
+
+def parse_ibkr_datetime_str(date_str: str) -> Optional[datetime]:
+    """
+    Parses date strings from IBKR which might include a timezone abbreviation.
+    Example: "20250324 09:30:00 US/Eastern" or "20250324"
+    Returns a naive datetime object.
+    """
+    cleaned_date_str = date_str.strip()
+    parts = cleaned_date_str.split(" ")
+    
+    datetime_part_to_parse = ""
+    if len(parts) >= 1: # Date part
+        datetime_part_to_parse = parts[0]
+    if len(parts) >= 2 and ":" in parts[1]: # Time part
+        datetime_part_to_parse += " " + parts[1]
+    
+    try:
+        if len(datetime_part_to_parse) == 8: # YYYYMMDD
+            return datetime.strptime(datetime_part_to_parse, "%Y%m%d")
+        elif len(datetime_part_to_parse) >= 17: # YYYYMMDD HH:MM:SS
+             # Ensure only one space between date and time if multiple were present
+            datetime_part_to_parse = datetime_part_to_parse.replace("  ", " ")
+            return datetime.strptime(datetime_part_to_parse, "%Y%m%d %H:%M:%S")
+        else:
+            print(f"[Date Parse Warning] Unrecognized date string format: '{date_str}' -> '{datetime_part_to_parse}'")
+            return None
+    except ValueError as ve:
+        print(f"[Date Parse Error] Could not parse '{datetime_part_to_parse}' from original '{date_str}': {ve}")
+        return None
+
 
 def fetch_long_term_hourly_data_for_symbol(
     app: IBDataApp,
@@ -84,18 +91,9 @@ def fetch_long_term_hourly_data_for_symbol(
     years_of_data: int,
     bar_size: str,
     what_to_show: str,
-    chunk_duration: str
+    chunk_duration_str: str
 ) -> Optional[pd.DataFrame]:
-    """
-    Fetches long-term hourly data for a single symbol by making chunked requests.
-    """
     all_bars_for_symbol = []
-    # Calculate number of months for chunking
-    total_months = years_of_data * 12
-    
-    print(f"Preparing to fetch {total_months} monthly chunks for {symbol} ({years_of_data} years)...")
-
-    # Create contract object once for the symbol
     base_contract = Contract()
     base_contract.symbol = symbol
     base_contract.secType = sec_type
@@ -104,76 +102,97 @@ def fetch_long_term_hourly_data_for_symbol(
     if primary_exchange:
         base_contract.primaryExchange = primary_exchange
 
-    # Iterate backwards in time, fetching month by month
-    # endDateTime for reqHistoricalData: "YYYYMMDD HH:MM:SS [TMZ]"
-    # If TMZ is not specified, TWS local time is assumed.
-    # It's often safer to specify UTC for intraday, but let's try TWS local first.
-    end_datetime_marker = datetime.now()
+    # Work with UTC internally for target dates to avoid timezone confusion
+    now_utc = datetime.now(timezone.utc)
+    target_start_date_utc = now_utc - timedelta(days=years_of_data * 365.25)
+    
+    # end_datetime_marker for API requests will be in UTC
+    end_datetime_marker_utc = now_utc
 
-    for i in range(total_months):
-        # Format endDateTime for the API
-        end_date_str_for_api = end_datetime_marker.strftime("%Y%m%d %H:%M:%S")
+    print(f"Fetching data for {symbol} back to approximately {target_start_date_utc.strftime('%Y-%m-%d %H:%M:%S %Z')}...")
+    chunk_count = 0
+
+    while end_datetime_marker_utc > target_start_date_utc:
+        chunk_count += 1
+        # Format endDateTime for the API in UTC: "YYYYMMDD HH:MM:SS UTC"
+        end_date_str_for_api = end_datetime_marker_utc.strftime("%Y%m%d %H:%M:%S UTC")
         
-        print(f"  Fetching chunk {i+1}/{total_months} for {symbol}, ending around {end_date_str_for_api}")
+        print(f"  Fetching chunk {chunk_count} for {symbol}, ending around {end_date_str_for_api} (duration {chunk_duration_str})")
 
         req_id = app.get_next_req_id()
-        # print(f"    ReqId: {req_id}, EndDateTime for API: {end_date_str_for_api}") # Verbose
-        
         completion_event = threading.Event()
         app._request_complete_events[req_id] = completion_event
         app.historical_data[req_id] = [] 
         app._error_message_for_request.pop(req_id, None)
 
         app.reqHistoricalData(
-            reqId=req_id,
-            contract=base_contract, # Use the same contract object
-            endDateTime=end_date_str_for_api,
-            durationStr=chunk_duration, # e.g., "1 M"
-            barSizeSetting=bar_size,
-            whatToShow=what_to_show,
-            useRTH=1, # For stocks, usually RTH is what's wanted for hourly
-            formatDate=1, # Request YYYYMMDD HH:MM:SS
-            keepUpToDate=False,
-            chartOptions=[]
+            reqId=req_id, contract=base_contract, endDateTime=end_date_str_for_api,
+            durationStr=chunk_duration_str, barSizeSetting=bar_size,
+            whatToShow=what_to_show, useRTH=1, formatDate=1, # formatDate=1 still returns string
+            keepUpToDate=False, chartOptions=[]
         )
         
-        timeout_chunk = 75 
-        completed = completion_event.wait(timeout=timeout_chunk)
-
+        completed = completion_event.wait(timeout=CHUNK_TIMEOUT_SECONDS)
         if req_id in app._request_complete_events: del app._request_complete_events[req_id]
         
         chunk_bars = app.historical_data.pop(req_id, [])
         chunk_error = app._error_message_for_request.pop(req_id, None)
 
+        approx_chunk_timedelta = timedelta(days=28 * int(chunk_duration_str.split(" ")[0])) if "M" in chunk_duration_str else timedelta(days=int(chunk_duration_str.split(" ")[0])) if "D" in chunk_duration_str else timedelta(days=30)
+
         if chunk_error:
             print(f"    Error fetching chunk for {symbol}: {chunk_error}")
-            time.sleep(CHUNK_REQUEST_DELAY) 
-            # Decrement end_datetime_marker to try fetching the period before this failed one
-            end_datetime_marker -= timedelta(days=28) # Approximate for "1 M"
+            time.sleep(CHUNK_REQUEST_DELAY + 5) 
+            end_datetime_marker_utc -= approx_chunk_timedelta
             continue 
+        
         if not completed and not chunk_bars:
             print(f"    Timeout fetching chunk for {symbol}.")
-            app.cancelHistoricalData(req_id)
-            time.sleep(CHUNK_REQUEST_DELAY)
-            end_datetime_marker -= timedelta(days=28)
+            app.cancelHistoricalData(req_id) # Attempt to cancel
+            time.sleep(CHUNK_REQUEST_DELAY + 5)
+            end_datetime_marker_utc -= approx_chunk_timedelta
             continue
         
         if chunk_bars:
             all_bars_for_symbol.extend(chunk_bars)
             print(f"    Fetched {len(chunk_bars)} bars for this chunk.")
-            # Update end_datetime_marker based on the start of the received data if possible
-            # This requires parsing the first bar's date.
-            # For simplicity, we'll just step back by the chunk duration.
-            if chunk_duration == "1 M":
-                 end_datetime_marker -= timedelta(days=28) # Approx. one month
-            # Add more logic here if using different CHUNK_DURATION values
-        else:
-            print(f"    No bars returned for this chunk of {symbol}. Moving to next period.")
-            # Still move back the end_datetime_marker to avoid getting stuck
-            if chunk_duration == "1 M":
-                 end_datetime_marker -= timedelta(days=28)
+            first_bar_date_str = chunk_bars[0].date # e.g., "20250324 09:30:00 US/Eastern"
+            parsed_first_bar_dt = parse_ibkr_datetime_str(first_bar_date_str)
+            
+            if parsed_first_bar_dt:
+                # Assume parsed_first_bar_dt is naive local time of the exchange.
+                # To make it comparable with our UTC markers, we'd ideally know the exchange's TZ.
+                # For stepping back, using it as naive is okay if end_datetime_marker_utc is also made naive for this step.
+                # Or, if TWS returns data aligned to UTC for intraday when UTC is requested, this is simpler.
+                # Given the API warning, using UTC for endDateTime in request is better.
+                # The dates returned by IBKR (formatDate=1) are often in the exchange's local time.
+                # For robust stepping, we should convert this local exchange time to UTC.
+                # This is complex without knowing the exact exchange timezone for each symbol.
+                # Simplification: Assume the parsed_first_bar_dt can be treated as a naive marker
+                # and we adjust our UTC end_datetime_marker_utc by a fixed duration.
+                # This means the next endDateTime will be set to the start of the received chunk.
+                
+                # For now, let's assume the first bar's datetime can be used to set the next end_datetime_marker
+                # We make it naive, then localize to UTC assuming it was exchange local time.
+                # This is still tricky. A simpler robust step-back is by the chunk duration.
+                end_datetime_marker_utc = end_datetime_marker_utc - approx_chunk_timedelta
+                # More precise would be:
+                # end_datetime_marker_utc = pytz.timezone("America/New_York").localize(parsed_first_bar_dt).astimezone(timezone.utc) - timedelta(seconds=1)
+                # But this requires knowing the exchange timezone.
+                # Let's stick to the approximate step back for now for simplicity,
+                # and rely on deduplication later.
+                print(f"    Next request for {symbol} will end before approx {parsed_first_bar_dt if parsed_first_bar_dt else 'failed_parse'}")
 
+            else: # Parsing failed
+                print(f"    Could not parse first bar date. Stepping back approximately.")
+                end_datetime_marker_utc -= approx_chunk_timedelta
+        else: 
+            print(f"    No bars returned for this chunk of {symbol}. Stepping back period.")
+            end_datetime_marker_utc -= approx_chunk_timedelta
 
+        if end_datetime_marker_utc < target_start_date_utc - timedelta(days=30): # Buffer
+             print(f"    End marker {end_datetime_marker_utc.strftime('%Y-%m-%d')} is before target {target_start_date_utc.strftime('%Y-%m-%d')}. Stopping for {symbol}.")
+             break
         time.sleep(CHUNK_REQUEST_DELAY)
 
     if not all_bars_for_symbol:
@@ -184,22 +203,25 @@ def fetch_long_term_hourly_data_for_symbol(
     if df.empty: return None
 
     try:
-        date_col_series = df['date']
-        if df['date'].iloc[0].isdigit() and len(df['date'].iloc[0]) == 8: # YYYYMMDD
-            df['date'] = pd.to_datetime(df['date'], format='%Y%m%d')
-        else: # Assuming YYYYMMDD HH:MM:SS or similar
-            normalized_dates = date_col_series.astype(str).str.replace(r'\s+', ' ', regex=True).str.strip()
-            df['date'] = pd.to_datetime(normalized_dates, errors='coerce') # More robust parsing
+        parsed_dates = [parse_ibkr_datetime_str(date_str) for date_str in df['date'].astype(str)]
+        df['DateTime'] = pd.Series(parsed_dates, index=df.index)
         
-        if df['date'].isnull().any():
-             print(f"[Warning] Some dates resulted in NaT after parsing for {symbol}. Original head: {date_col_series.head().tolist()}")
-
-        df.rename(columns={'date': 'DateTime', 'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume', 'barCount': 'BarCount', 'average': 'WAP'}, inplace=True)
+        if df['DateTime'].isnull().any():
+             print(f"[Warning] Some DateTime values are NaT after parsing for {symbol}.")
+        
+        df.drop(columns=['date'], inplace=True, errors='ignore') # Drop original string date column
+        df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume', 'barCount': 'BarCount', 'average': 'WAP'}, inplace=True)
         df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce').fillna(0).astype('int64')
-        df.set_index('DateTime', inplace=True)
         
-        df = df[~df.index.duplicated(keep='first')]
-        df.sort_index(inplace=True)
+        # Filter out rows where DateTime parsing failed (NaT) before setting index
+        df.dropna(subset=['DateTime'], inplace=True)
+        if df.empty:
+            print(f"[Warning] DataFrame became empty after dropping NaT DateTimes for {symbol}.")
+            return pd.DataFrame()
+            
+        df.set_index('DateTime', inplace=True)
+        df = df[~df.index.duplicated(keep='first')] 
+        df.sort_index(inplace=True) 
 
         columns_to_keep = ['Open', 'High', 'Low', 'Close', 'Volume', 'WAP', 'BarCount']
         available_columns = [col for col in columns_to_keep if col in df.columns]
@@ -210,17 +232,14 @@ def fetch_long_term_hourly_data_for_symbol(
 
     return df
 
-
 def main():
-    """Main function to orchestrate data fetching and aggregation."""
     create_output_dirs()
     app = IBDataApp() 
 
     print(f"Attempting to connect to TWS/Gateway on 127.0.0.1:{TWS_PORT} with Client ID {APP_CLIENT_ID}...")
     app.connect("127.0.0.1", TWS_PORT, clientId=APP_CLIENT_ID)
 
-    # Global api_thread variable for the main connection
-    global api_thread # Declare api_thread as global if it's defined outside and used in finally
+    global api_thread 
     api_thread = threading.Thread(target=app.run_loop, name=f"IB_API_Main_Thread", daemon=True)
     api_thread.start()
 
@@ -235,27 +254,22 @@ def main():
         return
 
     print("Connection to TWS successful. Starting data fetch process.")
+    print(f"Fetching UNADJUSTED data (whatToShow='{HOURLY_WHAT_TO_SHOW}'). Chunk duration: {CHUNK_DURATION}")
     
     all_daily_volumes_dict = {} 
 
-    try: # Wrap the main loop in try-finally to ensure disconnect
+    try: 
         for i, symbol in enumerate(SYMBOLS_TO_FETCH):
             print(f"\n--- Processing Symbol: {symbol} ({i+1}/{len(SYMBOLS_TO_FETCH)}) ---")
             
             primary_exchange = PRIMARY_EXCHANGE_MAP.get(symbol)
-            sec_type = "STK" # Assuming ETFs are handled as STK by IBKR for historical data
+            sec_type = "STK" 
 
             hourly_df = fetch_long_term_hourly_data_for_symbol(
-                app=app,
-                symbol=symbol,
-                sec_type=sec_type,
-                exchange=DEFAULT_EXCHANGE,
-                primary_exchange=primary_exchange,
-                currency=DEFAULT_CURRENCY,
-                years_of_data=YEARS_OF_DATA,
-                bar_size=HOURLY_BAR_SIZE,
-                what_to_show=HOURLY_WHAT_TO_SHOW,
-                chunk_duration=CHUNK_DURATION
+                app=app, symbol=symbol, sec_type=sec_type, exchange=DEFAULT_EXCHANGE,
+                primary_exchange=primary_exchange, currency=DEFAULT_CURRENCY,
+                years_of_data=YEARS_OF_DATA, bar_size=HOURLY_BAR_SIZE,
+                what_to_show=HOURLY_WHAT_TO_SHOW, chunk_duration_str=CHUNK_DURATION
             )
 
             if hourly_df is not None and not hourly_df.empty:
@@ -266,11 +280,13 @@ def main():
                 except Exception as e:
                     print(f"Error saving hourly CSV for {symbol}: {e}")
 
-                if 'Volume' in hourly_df.columns:
+                if 'Volume' in hourly_df.columns and not hourly_df.index.hasnans: # Check for NaNs in index
                     daily_volume = hourly_df['Volume'].resample('D').sum()
                     daily_volume.name = symbol 
                     all_daily_volumes_dict[symbol] = daily_volume
                     print(f"Aggregated daily volume for {symbol}.")
+                elif hourly_df.index.hasnans:
+                    print(f"Could not aggregate daily volume for {symbol} due to NaT in DateTimeIndex.")
                 else:
                     print(f"Could not find 'Volume' column to aggregate daily volume for {symbol}.")
             else:
@@ -287,18 +303,17 @@ def main():
             try:
                 all_daily_volumes_df.to_csv(OUTPUT_DAILY_VOLUME_CSV)
                 print(f"Successfully saved aggregated daily volumes to {OUTPUT_DAILY_VOLUME_CSV}")
-                print(all_daily_volumes_df.info())
             except Exception as e:
                 print(f"Error saving daily volumes CSV: {e}")
         else:
             print("No daily volumes were aggregated.")
 
-    finally: # Ensure disconnection happens
+    finally: 
         if app.isConnected():
             print("\nDisconnecting from TWS/Gateway...")
             app.disconnect()
             time.sleep(2) 
-            if api_thread.is_alive(): # Check if thread is defined and alive
+            if 'api_thread' in locals() and api_thread.is_alive(): 
                  print("[Warning] Main API thread still alive after disconnect.")
         
         print("\n--- Long-Term Data Fetch Script Finished ---")
